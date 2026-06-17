@@ -14,8 +14,12 @@ cache/
 # Environment
 .env
 
+# Logs
+logs/
+
+# NSSM binary and zips
+nssm/
+*.zip
+
 # VS Code
 .vscode/
-
-# Docker
-.dockerignore
