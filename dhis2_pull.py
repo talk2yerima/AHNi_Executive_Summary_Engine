@@ -1420,6 +1420,31 @@ if not new_m_all:
 
 log.info("   Total monthly records: %d", len(m_records))
 
+# 6g. Back-fill any quarterly RADET gaps now that the monthly pull may have
+#     downloaded the same file (e.g. Qtr3 fails in 5c but Jun-26 succeeds in 6c)
+_q_radet_covered = {rec["Quarter"] for rec in new_q_radet}
+_backfill_radet  = []
+for q_raw in PULL_QUARTERS:
+    q_label     = QUARTER_LABEL[q_raw]
+    if q_label in _q_radet_covered:
+        continue
+    snap_date   = PULL_LAST_DAYS_Q[q_raw]
+    snap_iso    = f"{snap_date[:4]}-{snap_date[4:6]}-{snap_date[6:]}"
+    q_start_iso = _quarter_start(q_raw)
+    if snap_iso not in _RADET_MEM_CACHE:
+        continue
+    log.info("   6g. Backfill %s RADET from memory (monthly pull succeeded) ...", q_label)
+    radet_data = pull_radet_for_date(snap_iso, q_start_iso, snap_iso)
+    for col_name, by_ou in radet_data.items():
+        for ou_uid, value in by_ou.items():
+            rec = make_rec(ou_uid, q_raw, None, col_name, value, "quarterly")
+            _backfill_radet.append(rec)
+    log.info("      %s: backfilled %d records", q_label, len(_backfill_radet))
+if _backfill_radet:
+    q_records.extend(_backfill_radet)
+    new_q_radet.extend(_backfill_radet)
+    cache_put_recs(conn_cache, _backfill_radet, "quarterly")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Build quarterly summary (STATE, FACILITY, Quarter as index)
