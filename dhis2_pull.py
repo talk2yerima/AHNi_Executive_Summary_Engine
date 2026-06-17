@@ -3,7 +3,7 @@ dhis2_pull.py  —  Pull all ACEBAY indicators for 74 facilities, THIS_FY
 Run: .venv\Scripts\python dhis2_pull.py
 
 Output: output/dhis2_acebay_74facilities_FY26_<timestamp>.xlsx
-  Sheet "Quarterly" — STATE, FACILITY, Qtr1..Qtr4 + FY26 total
+  Sheet "Quarterly" — STATE, FACILITY, Qtr1..QtrN (started only) + FY26 total
   Sheet "Monthly"   — STATE, FACILITY, Oct-25..Sep-26
 """
 
@@ -1031,11 +1031,16 @@ if ARGS.mode == "incremental":
     log.info("   Mode: INCREMENTAL — API for %s / %s; cache for %d quarters, %d months",
              open_q_label, open_m_label, len(CACHE_Q_LABELS), len(CACHE_M_LABELS))
 else:
-    PULL_QUARTERS  = THIS_FY_QUARTERS
-    PULL_MONTHS    = THIS_FY_MONTHS
+    _today_iso = date.today().isoformat()
+    # Exclude quarters/months whose start date is still in the future
+    PULL_QUARTERS  = [q for q in THIS_FY_QUARTERS if _quarter_start(q) <= _today_iso]
+    PULL_MONTHS    = [m for m in THIS_FY_MONTHS    if _month_start(m)   <= _today_iso]
     CACHE_Q_LABELS = []
     CACHE_M_LABELS = []
+    _skipped_q = [QUARTER_LABEL[q] for q in THIS_FY_QUARTERS if q not in PULL_QUARTERS]
     log.info("   Mode: FULL — pulling all periods from API")
+    if _skipped_q:
+        log.info("   Skipping future quarter(s) not yet started: %s", ", ".join(_skipped_q))
 
 _today = date.today().strftime("%Y%m%d")
 # For open (unfinished) periods use today's date so we get actual data instead of blanks
@@ -1471,7 +1476,7 @@ else:
     _snap_derived = SNAPSHOT_COLS | {"VLC", "VLS", "Linkage Rate"}
     _flow_cols_q  = [c for c in quarterly.select_dtypes(include="number").columns
                      if c not in _snap_derived]
-    _q_order_ytd  = [QUARTER_LABEL[q] for q in THIS_FY_QUARTERS]
+    _q_order_ytd  = [QUARTER_LABEL[q] for q in PULL_QUARTERS]
     _fy_lbl       = f"FY{THIS_FY % 100}"
 
     for _, _grp in quarterly.groupby(["STATE", "FACILITY"], sort=False):
@@ -1614,7 +1619,8 @@ with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
                         c.number_format = PCT_FMT
 
 log.info("Saved: %s", out_file)
-log.info("  Sheet 'Quarterly' — STATE, FACILITY, Qtr1..Qtr4 + FY26 per facility")
+log.info("  Sheet 'Quarterly' — STATE, FACILITY, %s + FY26 per facility",
+         ", ".join(QUARTER_LABEL[q] for q in PULL_QUARTERS))
 log.info("  Sheet 'Monthly'   — STATE, FACILITY, Oct-25..Sep-26 per facility")
 
 # ─────────────────────────────────────────────────────────────────────────────
