@@ -1205,6 +1205,8 @@ q_records.extend(new_q_flow)
 
 # 5c. TX_CURR (snapshot — last day of each quarter)
 log.info("   5c. RADET pull: TX_CURR, TX_PVLS_D/N, HTS_TST/POS (quarterly) ...")
+_RADET_COLS = {"TX_CURR", "TX_PVLS_D", "TX_PVLS_N", "HTS_TST", "HTS_TST_POS"}
+
 new_q_radet = []
 for q_raw in PULL_QUARTERS:
     snap_date   = PULL_LAST_DAYS_Q[q_raw]          # 'YYYYMMDD'
@@ -1214,6 +1216,19 @@ for q_raw in PULL_QUARTERS:
     if q_start_iso > snap_iso:
         log.info("      %s: quarter hasn't started yet (%s > today) — skipping", q_label, q_start_iso)
         continue
+    # Closed period: last day of quarter is strictly before today
+    _q_is_closed = QUARTER_LAST_DAY[q_raw] < _today
+    if _q_is_closed and conn_cache:
+        _n = conn_cache.execute(
+            "SELECT COUNT(*) FROM cache WHERE period=? AND col_name='TX_CURR' AND view='quarterly'",
+            (q_label,)
+        ).fetchone()[0]
+        if _n >= len(FACILITIES):
+            log.info("      %s: closed period fully cached (%d facilities) — skipping RADET download", q_label, _n)
+            _cached_radet = [r for r in cache_get_recs(conn_cache, [q_label], "quarterly")
+                             if r.get("column") in _RADET_COLS]
+            q_records.extend(_cached_radet)
+            continue
     log.info("      %s: snapshot=%s  HTS range=%s → %s", q_label, snap_iso, q_start_iso, snap_iso)
     radet_data = pull_radet_for_date(snap_iso, q_start_iso, snap_iso)
     for col_name, by_ou in radet_data.items():
@@ -1336,6 +1351,19 @@ for m_raw in PULL_MONTHS:
     if m_start_iso > snap_iso:
         log.info("      %s: month hasn't started yet (%s > today) — skipping", m_label, m_start_iso)
         continue
+    # Closed period: last day of month is strictly before today
+    _m_is_closed = MONTH_LAST_DAY[m_raw] < _today
+    if _m_is_closed and conn_cache:
+        _n = conn_cache.execute(
+            "SELECT COUNT(*) FROM cache WHERE period=? AND col_name='TX_CURR' AND view='monthly'",
+            (m_label,)
+        ).fetchone()[0]
+        if _n >= len(FACILITIES):
+            log.info("      %s: closed period fully cached (%d facilities) — skipping RADET download", m_label, _n)
+            _cached_radet = [r for r in cache_get_recs(conn_cache, [m_label], "monthly")
+                             if r.get("column") in _RADET_COLS]
+            m_records.extend(_cached_radet)
+            continue
     log.info("      %s: snapshot=%s  HTS range=%s → %s", m_label, snap_iso, m_start_iso, snap_iso)
     radet_data = pull_radet_for_date(snap_iso, m_start_iso, snap_iso)
     for col_name, by_ou in radet_data.items():
