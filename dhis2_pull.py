@@ -77,6 +77,231 @@ def _azure_upload(local_path, blob_name):
     return f"https://{account}.blob.core.windows.net/{os.getenv('AZURE_CONTAINER_NAME')}/{blob_name}"
 
 
+# ── RADET helpers ─────────────────────────────────────────────────────────────
+import io as _io
+
+_RADET_MEM_CACHE   = {}   # date_str → {"radet_df": df, "hts_df": df}
+_DATIMID_MAP_FILE  = Path(__file__).parent / "config" / "datimid_map.json"
+_datimid_map: dict = {}   # populated lazily on first RADET download
+
+_STATE_CODES = {"ad", "bo", "ta", "yo"}
+
+def _strip_state_prefix(name: str) -> str:
+    parts = name.strip().split(" ", 1)
+    if len(parts) == 2 and parts[0].lower() in _STATE_CODES:
+        return parts[1].strip()
+    return name.strip()
+
+
+def _build_datimid_map(radet_df) -> dict:
+    """Fuzzy-match RADET DatimId → ACEBAY OU_UID via facility names. Saved to config/datimid_map.json."""
+    from rapidfuzz import process, fuzz
+    fac_names = {_strip_state_prefix(f["name"]): f["id"] for f in FACILITIES}
+    unique = radet_df[["DatimId", "Facility Name"]].drop_duplicates("DatimId")
+    mapping = {}
+    for _, row in unique.iterrows():
+        clean = _strip_state_prefix(str(row["Facility Name"]))
+        if clean in fac_names:
+            mapping[row["DatimId"]] = fac_names[clean]
+        else:
+            hit = process.extractOne(clean, list(fac_names.keys()), scorer=fuzz.WRatio, score_cutoff=65)
+            if hit:
+                mapping[row["DatimId"]] = fac_names[hit[0]]
+            else:
+                log.warning("   DatimId map: no match for '%s' (%s)", clean, row["DatimId"])
+    _DATIMID_MAP_FILE.parent.mkdir(exist_ok=True)
+    import json as _json
+    _json.dump(mapping, open(_DATIMID_MAP_FILE, "w"), indent=2)
+    log.info("   DatimId map: built %d/%d entries → config/datimid_map.json", len(mapping), len(unique))
+    return mapping
+
+
+def _load_datimid_map() -> dict:
+    import json as _json
+    if _DATIMID_MAP_FILE.exists():
+        m = _json.load(open(_DATIMID_MAP_FILE))
+        log.info("   DatimId map: loaded %d entries from config/datimid_map.json", len(m))
+        return m
+    return {}
+
+
+def _quarter_start(q_raw: str) -> str:
+    """'2026Q1' → '2026-01-01'"""
+    yr = int(q_raw[:4])
+    qn = int(q_raw[5])
+    month = (qn - 1) * 3 + 1
+    return f"{yr}-{month:02d}-01"
+
+
+def _month_start(m_raw: str) -> str:
+    """'202601' → '2026-01-01'"""
+    return f"{m_raw[:4]}-{m_raw[4:]}-01"
+
+
+def _download_radet_stream(snapshot_date_str: str):
+    """Download RADET blob → BytesIO. Returns None on failure."""
+    blob_name = RADET_BLOB_PATTERN.format(date=snapshot_date_str)
+    log.info("      Downloading RADET: %s ...", blob_name)
+    try:
+        from azure.storage.blob import BlobServiceClient
+        client = BlobServiceClient.from_connection_string(os.getenv("AZURE_CONNECTION_STRING"))
+        blob   = client.get_container_client(RADET_CONTAINER).get_blob_client(blob_name)
+        stream = _io.BytesIO()
+        blob.download_blob().readinto(stream)
+        stream.seek(0)
+        log.info("      Download complete: %s", blob_name)
+        return stream
+    except Exception as e:
+        log.error("      RADET download failed (%s): %s", blob_name, e)
+        return None
+
+
+def pull_radet_for_date(snapshot_date_str: str, period_start_str: str, period_end_str: str) -> dict:
+    """
+    Return {col_name: {ou_uid: float}} for the given period.
+
+    snapshot_date_str : 'YYYY-MM-DD' — which RADET file to download
+    period_start_str  : 'YYYY-MM-DD' — start of HTS flow period
+    period_end_str    : 'YYYY-MM-DD' — end of HTS flow period (= snapshot date)
+
+    Indicators computed:
+      TX_CURR     — Active/Active-Restart patients (snapshot)
+      TX_PVLS_D   — eligible for VL: Active, on ART ≥180 d, VL in last 365 d
+      TX_PVLS_N   — TX_PVLS_D with Current Viral Load < 1000
+      HTS_TST     — all HIV tests in [period_start, period_end]
+      HTS_TST_POS — positive tests in [period_start, period_end]
+    """
+    global _datimid_map
+
+    # ── Use in-memory cache to avoid re-downloading the same 119 MB file ──────
+    if snapshot_date_str not in _RADET_MEM_CACHE:
+        stream = _download_radet_stream(snapshot_date_str)
+        if stream is None:
+            return {}
+
+        # CombinedRADET sheet ─────────────────────────────────────────────────
+        RADET_COLS = [
+            "DatimId", "Facility Name", "State",
+            "Current ART Status",
+            "ART Start Date (yyyy-mm-dd)",
+            "Date of Current ViralLoad Result Sample (yyyy-mm-dd)",
+            "Current Viral Load (c/ml)",
+        ]
+        try:
+            radet_df = pd.read_excel(stream, sheet_name="CombinedRADET",
+                                     usecols=RADET_COLS, engine="openpyxl")
+        except Exception as e:
+            log.error("      CombinedRADET sheet read failed: %s", e)
+            radet_df = pd.DataFrame()
+
+        # Build/load DatimId → OU_UID map on first successful load ─────────────
+        if not radet_df.empty and not _datimid_map:
+            _datimid_map = _load_datimid_map()
+            if not _datimid_map:
+                _datimid_map = _build_datimid_map(radet_df)
+
+        # CombinedHTS sheet ───────────────────────────────────────────────────
+        HTS_COLS = ["datimCode", "dateOfHIVTesting", "finalHIVTestResult"]
+        stream.seek(0)
+        try:
+            hts_df = pd.read_excel(stream, sheet_name="CombinedHTS",
+                                   usecols=HTS_COLS, engine="openpyxl")
+        except Exception as e:
+            log.error("      CombinedHTS sheet read failed: %s", e)
+            hts_df = pd.DataFrame()
+
+        _RADET_MEM_CACHE[snapshot_date_str] = {"radet_df": radet_df, "hts_df": hts_df}
+        log.info("      RADET loaded: %d ART rows, %d HTS rows",
+                 len(radet_df), len(hts_df))
+    else:
+        log.info("      RADET %s: using in-memory cache", snapshot_date_str)
+
+    radet_df = _RADET_MEM_CACHE[snapshot_date_str]["radet_df"]
+    hts_df   = _RADET_MEM_CACHE[snapshot_date_str]["hts_df"]
+    dm       = _datimid_map
+    fac_uid_set = {f["id"] for f in FACILITIES}
+
+    snap_dt  = _dt.strptime(snapshot_date_str, "%Y-%m-%d").date()
+    start_dt = _dt.strptime(period_start_str,  "%Y-%m-%d").date()
+    end_dt   = _dt.strptime(period_end_str,    "%Y-%m-%d").date()
+
+    result: dict = {}
+
+    # ── TX_CURR ───────────────────────────────────────────────────────────────
+    if not radet_df.empty:
+        active = radet_df[
+            radet_df["Current ART Status"].str.contains("active", case=False, na=False)
+        ]
+        tx_curr = active.groupby("DatimId").size()
+        result["TX_CURR"] = {
+            dm[d]: float(v) for d, v in tx_curr.items()
+            if d in dm and dm[d] in fac_uid_set
+        }
+
+        # ── TX_PVLS base filter ────────────────────────────────────────────────
+        pvls = radet_df[
+            radet_df["Current ART Status"].isin(["Active", "Active Restart"])
+        ].copy()
+        pvls["vl_date"]  = pd.to_datetime(
+            pvls["Date of Current ViralLoad Result Sample (yyyy-mm-dd)"], errors="coerce"
+        ).dt.date
+        pvls["art_date"] = pd.to_datetime(
+            pvls["ART Start Date (yyyy-mm-dd)"], errors="coerce"
+        ).dt.date
+
+        one_year_ago = snap_dt - pd.Timedelta(days=365)
+        pvls = pvls[
+            pvls["vl_date"].notna() &
+            pvls["art_date"].notna() &
+            (pvls["vl_date"] <= snap_dt) &
+            (pvls["vl_date"] >= one_year_ago) &
+            ((pvls["vl_date"] - pvls["art_date"]).apply(
+                lambda d: d.days if hasattr(d, "days") else -1
+            ) >= 180)
+        ]
+
+        tx_pvls_d = pvls.groupby("DatimId").size()
+        result["TX_PVLS_D"] = {
+            dm[d]: float(v) for d, v in tx_pvls_d.items()
+            if d in dm and dm[d] in fac_uid_set
+        }
+
+        # ── TX_PVLS_N (suppressed: VL < 1000) ─────────────────────────────────
+        pvls["vl_num"] = pd.to_numeric(pvls["Current Viral Load (c/ml)"], errors="coerce")
+        supp = pvls[pvls["vl_num"] < 1000]
+        tx_pvls_n = supp.groupby("DatimId").size()
+        result["TX_PVLS_N"] = {
+            dm[d]: float(v) for d, v in tx_pvls_n.items()
+            if d in dm and dm[d] in fac_uid_set
+        }
+
+    # ── HTS_TST / HTS_TST_POS (flow — filter by date range) ──────────────────
+    if not hts_df.empty:
+        hts_df["hts_date"] = pd.to_datetime(hts_df["dateOfHIVTesting"], errors="coerce").dt.date
+        period_hts = hts_df[
+            hts_df["hts_date"].notna() &
+            (hts_df["hts_date"] >= start_dt) &
+            (hts_df["hts_date"] <= end_dt)
+        ]
+        hts_tst = period_hts.groupby("datimCode").size()
+        result["HTS_TST"] = {
+            dm.get(d, d): float(v) for d, v in hts_tst.items()
+            if dm.get(d, d) in fac_uid_set
+        }
+        pos_hts = period_hts[
+            period_hts["finalHIVTestResult"].str.strip().str.lower() == "positive"
+        ]
+        hts_pos = pos_hts.groupby("datimCode").size()
+        result["HTS_TST_POS"] = {
+            dm.get(d, d): float(v) for d, v in hts_pos.items()
+            if dm.get(d, d) in fac_uid_set
+        }
+
+    counts = {k: len(v) for k, v in result.items()}
+    log.info("      RADET results: %s", counts)
+    return result
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_URL = os.getenv("DHIS2_URL", "").rstrip("/")
 USERNAME = os.getenv("DHIS2_USER")
@@ -136,8 +361,6 @@ SNAPSHOT_COLS = {"TX_CURR", "TX_PVLS_D", "TX_PVLS_N"}
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 INDICATOR_MAP = {
-    "ACEBAY HTS_TST"                  : "HTS_TST",
-    "ACEBAY HTS_TST_POS"              : "HTS_TST_POS",
     "ACEBAY_PMTCT_ART-Already on ART" : "PMTCT_ART.Already.T",
     "ACEBAY PMTCT_ART-New on ART"     : "PMTCT_ART.New.T",
     "ACEBAY PMTCT_Known Positive"     : "PMTCT_STAT.N.Known.Pos.T",
@@ -147,6 +370,8 @@ INDICATOR_MAP = {
     "ACEBAY TB_ART New on ART"        : "TB_ART.New.T",
 }
 SKIP_INDICATORS = {
+    "ACEBAY HTS_TST",
+    "ACEBAY HTS_TST_POS",
     "ACEBAY TB_ART-Already on ART",
     "ACEBAY TB_ART-New on ART",
     "ACEBAY TB_PREV_D",
@@ -163,16 +388,13 @@ DATA_ELEMENT_MAP = {
     "uXsX7BTOuPa" : "POST_RESP.S.T",    # DR POST-RESP Sexual Violence_v22
 }
 
-# Snapshot data element (last day of period)
-SNAPSHOT_DE_MAP = {
-    "QqxtdN19c78" : "TX_CURR",
-}
+# TX_CURR and TX_PVLS are now sourced from the Combined RADET (see section 5c/6c)
+SNAPSHOT_DE_MAP  = {}   # was TX_CURR — now from RADET
+SNAPSHOT_BAY_MAP = {}   # was TX_PVLS_D/N — now from RADET
 
-# BAY disaggregated snapshot elements (discovered by name search, then summed)
-SNAPSHOT_BAY_MAP = {
-    "TX_PVLS_D" : "TX_PVLS_D",
-    "TX_PVLS_N" : "TX_PVLS_N",
-}
+# RADET blob config
+RADET_CONTAINER    = os.getenv("RADET_CONTAINER",    "combine-radets-xls")
+RADET_BLOB_PATTERN = os.getenv("RADET_BLOB_PATTERN", "{date}/ACE-1_Combined_RADET-{date}.xlsx")
 
 OUTPUT_DIR    = Path(__file__).parent / "output"
 FACILITY_FILE = Path(__file__).parent / "config" / "facility_list.json"
@@ -849,19 +1071,18 @@ log.info("   Pulling %d mapped indicator(s) (skipping %d unmapped)",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Discover BAY TX_PVLS UIDs
+# 4. TX_PVLS → now from RADET (SNAPSHOT_BAY_MAP is empty)
 # ─────────────────────────────────────────────────────────────────────────────
-log.info("4. Discovering BAY TX_PVLS element UIDs ...")
-pvls_uids = {}
-for search_term, col_name in SNAPSHOT_BAY_MAP.items():
-    res   = get("dataElements", {
-        "filter" : f"name:ilike:{search_term}",
-        "fields" : "id,name",
-        "paging" : "false",
-    })
-    items = res.get("dataElements", [])
-    pvls_uids[col_name] = [i["id"] for i in items]
-    log.info("   %s: %d element(s)", col_name, len(items))
+log.info("4. TX_PVLS/TX_CURR now sourced from Combined RADET — skipping DHIS2 discovery.")
+pvls_uids = {}   # kept for compatibility; will be empty
+
+# 4d. Pre-load DatimId map if config file already exists (avoids rebuild on every run)
+log.info("4d. Loading DatimId → OU_UID map ...")
+_datimid_map = _load_datimid_map()
+if _datimid_map:
+    log.info("   Map ready (%d entries). Will rebuild if RADET is downloaded fresh.", len(_datimid_map))
+else:
+    log.info("   No map file yet — will build on first RADET download.")
 
 log.info("4b. Discovering TX_TB data element UIDs ...")
 # TX_TB.N.Already.T → DR ...Clinic_Encounter  |  TX_TB.N.New.T → DR ...Care_New
@@ -983,40 +1204,24 @@ if _failed_5b:
 q_records.extend(new_q_flow)
 
 # 5c. TX_CURR (snapshot — last day of each quarter)
-log.info("   5c. TX_CURR (snapshot — last day of quarter) ...")
-snap_uid_list = list(SNAPSHOT_DE_MAP.keys())
-# Deduplicate dates: future quarters share today's date — earliest quarter wins
-last_days_q = list(dict.fromkeys(PULL_LAST_DAYS_Q.values()))
-day_to_quarter = {}
-for q, day in PULL_LAST_DAYS_Q.items():
-    if day not in day_to_quarter:
-        day_to_quarter[day] = q
-rows, _failed_5c = pull_analytics(snap_uid_list, last_days_q, OU_UID_LIST, SNAPSHOT_DE_MAP)
-log.info("      %d row(s)", len(rows))
-new_q_snap = []
-for period, ou_uid, col_name, value in rows:
-    quarter_raw = day_to_quarter.get(period, period)
-    rec = make_rec(ou_uid, quarter_raw, None, col_name, value, "quarterly")
-    new_q_snap.append(rec)
-if _failed_5c:
-    _report_missing(_failed_5c, "TX_CURR (quarterly)")
-q_records.extend(new_q_snap)
-
-# 5d. TX_PVLS_D/N (snapshot — sum BAY elements on last day of each quarter)
-log.info("   5d. TX_PVLS_D/N (snapshot — last day of quarter) ...")
-new_q_pvls = []
-for col_name, uid_list in pvls_uids.items():
-    if not uid_list:
-        continue
-    totals, _failed_5d = pull_bay_sum(uid_list, last_days_q, OU_UID_LIST, col_name)
-    log.info("      %s: %d (period, facility) combinations", col_name, len(totals))
-    for (period, ou_uid), total in totals.items():
-        quarter_raw = day_to_quarter.get(period, period)
-        rec = make_rec(ou_uid, quarter_raw, None, col_name, total, "quarterly")
-        new_q_pvls.append(rec)
-    if _failed_5d:
-        _report_missing(_failed_5d, f"{col_name} (quarterly)")
-q_records.extend(new_q_pvls)
+log.info("   5c. RADET pull: TX_CURR, TX_PVLS_D/N, HTS_TST/POS (quarterly) ...")
+new_q_radet = []
+for q_raw in PULL_QUARTERS:
+    snap_date   = PULL_LAST_DAYS_Q[q_raw]          # 'YYYYMMDD'
+    snap_iso    = f"{snap_date[:4]}-{snap_date[4:6]}-{snap_date[6:]}"
+    q_start_iso = _quarter_start(q_raw)
+    q_label     = QUARTER_LABEL[q_raw]
+    log.info("      %s: snapshot=%s  HTS range=%s → %s", q_label, snap_iso, q_start_iso, snap_iso)
+    radet_data = pull_radet_for_date(snap_iso, q_start_iso, snap_iso)
+    for col_name, by_ou in radet_data.items():
+        for ou_uid, value in by_ou.items():
+            rec = make_rec(ou_uid, q_raw, None, col_name, value, "quarterly")
+            new_q_radet.append(rec)
+    if not radet_data:
+        log.warning("      %s: no RADET data — these columns will be blank", q_label)
+q_records.extend(new_q_radet)
+new_q_snap = new_q_radet   # kept for new_q_all reference below
+new_q_pvls = []             # was separate; now folded into new_q_radet
 
 # 5e. TX_TB.N.Already/New (flow — sum over quarter period)
 log.info("   5e. TX_TB.N.Already/New (flow — sum over quarter) ...")
@@ -1051,7 +1256,7 @@ for col_name, uid_list in tbprev_uids.items():
 q_records.extend(new_q_tbprev)
 
 # Save new quarterly records to cache
-new_q_all = new_q_ace + new_q_flow + new_q_snap + new_q_pvls + new_q_txtb + new_q_tbprev
+new_q_all = new_q_ace + new_q_flow + new_q_radet + new_q_txtb + new_q_tbprev
 if new_q_all:
     cache_put_recs(conn_cache, new_q_all, "quarterly")
 if not new_q_all:
@@ -1117,40 +1322,25 @@ if _failed_6b:
     _report_missing(_failed_6b, "TX_NEW/POST_RESP (monthly)")
 m_records.extend(new_m_flow)
 
-# 6c. TX_CURR (snapshot — last day of each month)
-log.info("   6c. TX_CURR (snapshot — last day of each month) ...")
-# Deduplicate dates: future months share today's date — earliest month wins
-last_days_m = list(dict.fromkeys(PULL_LAST_DAYS_M.values()))
-day_to_month = {}
-for m, day in PULL_LAST_DAYS_M.items():
-    if day not in day_to_month:
-        day_to_month[day] = m
-rows, _failed_6c = pull_analytics(snap_uid_list, last_days_m, OU_UID_LIST, SNAPSHOT_DE_MAP)
-log.info("      %d row(s)", len(rows))
-new_m_snap = []
-for period, ou_uid, col_name, value in rows:
-    month_period = day_to_month.get(period, period)
-    rec = make_rec(ou_uid, None, month_period, col_name, value, "monthly")
-    new_m_snap.append(rec)
-if _failed_6c:
-    _report_missing(_failed_6c, "TX_CURR (monthly)")
-m_records.extend(new_m_snap)
-
-# 6d. TX_PVLS_D/N (snapshot — sum BAY elements on last day of each month)
-log.info("   6d. TX_PVLS_D/N (snapshot — last day of each month) ...")
-new_m_pvls = []
-for col_name, uid_list in pvls_uids.items():
-    if not uid_list:
-        continue
-    totals, _failed_6d = pull_bay_sum(uid_list, last_days_m, OU_UID_LIST, col_name)
-    log.info("      %s: %d (period, facility) combinations", col_name, len(totals))
-    for (period, ou_uid), total in totals.items():
-        month_period = day_to_month.get(period, period)
-        rec = make_rec(ou_uid, None, month_period, col_name, total, "monthly")
-        new_m_pvls.append(rec)
-    if _failed_6d:
-        _report_missing(_failed_6d, f"{col_name} (monthly)")
-m_records.extend(new_m_pvls)
+# 6c. RADET pull: TX_CURR, TX_PVLS_D/N, HTS_TST/POS (monthly)
+log.info("   6c. RADET pull: TX_CURR, TX_PVLS_D/N, HTS_TST/POS (monthly) ...")
+new_m_radet = []
+for m_raw in PULL_MONTHS:
+    snap_date   = PULL_LAST_DAYS_M[m_raw]          # 'YYYYMMDD'
+    snap_iso    = f"{snap_date[:4]}-{snap_date[4:6]}-{snap_date[6:]}"
+    m_start_iso = _month_start(m_raw)
+    m_label     = MONTH_LABEL[m_raw]
+    log.info("      %s: snapshot=%s  HTS range=%s → %s", m_label, snap_iso, m_start_iso, snap_iso)
+    radet_data = pull_radet_for_date(snap_iso, m_start_iso, snap_iso)
+    for col_name, by_ou in radet_data.items():
+        for ou_uid, value in by_ou.items():
+            rec = make_rec(ou_uid, None, m_raw, col_name, value, "monthly")
+            new_m_radet.append(rec)
+    if not radet_data:
+        log.warning("      %s: no RADET data — these columns will be blank", m_label)
+m_records.extend(new_m_radet)
+new_m_snap = new_m_radet   # kept for new_m_all reference below
+new_m_pvls = []             # was separate; now folded into new_m_radet
 
 # 6e. TX_TB.N.Already/New (flow — sum over month period)
 log.info("   6e. TX_TB.N.Already/New (flow — sum over month) ...")
@@ -1183,7 +1373,7 @@ for col_name, uid_list in tbprev_uids.items():
 m_records.extend(new_m_tbprev)
 
 # Save new monthly records to cache
-new_m_all = new_m_ace + new_m_flow + new_m_snap + new_m_pvls + new_m_txtb + new_m_tbprev
+new_m_all = new_m_ace + new_m_flow + new_m_radet + new_m_txtb + new_m_tbprev
 if new_m_all:
     cache_put_recs(conn_cache, new_m_all, "monthly")
 if not new_m_all:
