@@ -1,0 +1,78 @@
+{
+  "_comment": "Map your DHIS2 DataElement UIDs to the indicator names used in the output.",
+  "_instructions": [
+    "1. Export your UIDs from DHIS2: GET /api/dataElements.json?fields=id,name&paging=false",
+    "2. Replace each placeholder UID (e.g. UID_HTS_TST) with the real ID from your DHIS2 instance.",
+    "3. For sub-indicators that share a DataElement but differ by CategoryOptionCombo,",
+    "   add them under category_filters below.",
+    "4. Save and restart the container - no code changes needed."
+  ],
+  "dataelement_map": {
+    "UID_HTS_TST": "HTS_TST",
+    "UID_HTS_TST_POS": "HTS_TST_POS",
+    "Jt8x99v4EA0": "TX_NEW",
+    "QqxtdN19c78": "TX_CURR",
+    "ODqgYy5t2uj": "TX_PVLS_D",
+    "WhaMgt6xny2": "TX_PVLS_N",
+    "UID_PMTCT_ART": "PMTCT_ART",
+    "UID_PMTCT_STAT": "PMTCT_STAT",
+    "UID_POST_RESP": "POST_RESP",
+    "UID_TB_ART": "TB_ART",
+    "UID_TB_PREV": "TB_PREV",
+    "UID_TX_TB": "TX_TB"
+  },
+  "category_filters": {
+    "PMTCT_ART.Already.T": {
+      "dataelement": "UID_PMTCT_ART",
+      "category_combo": "UID_CAT_ALREADY"
+    },
+    "PMTCT_ART.New.T": {
+      "dataelement": "UID_PMTCT_ART",
+      "category_combo": "UID_CAT_NEW"
+    },
+    "PMTCT_STAT.N.Known.Pos.T": {
+      "dataelement": "UID_PMTCT_STAT",
+      "category_combo": "UID_CAT_KNOWN_POS"
+    },
+    "PMTCT_STAT.N.New.Neg.T": {
+      "dataelement": "UID_PMTCT_STAT",
+      "category_combo": "UID_CAT_NEW_NEG"
+    },
+    "PMTCT_STAT.N.New.Pos.T": {
+      "dataelement": "UID_PMTCT_STAT",
+      "category_combo": "UID_CAT_NEW_POS"
+    },
+    "POST_RESP.PE.T": {
+      "dataelement": "UID_POST_RESP",
+      "category_combo": "UID_CAT_PE"
+    },
+    "POST_RESP.S.T": {
+      "dataelement": "UID_POST_RESP",
+      "category_combo": "UID_CAT_S"
+    },
+    "TB_ART.Already.T": {
+      "dataelement": "UID_TB_ART",
+      "category_combo": "UID_CAT_ALREADY"
+    },
+    "TB_ART.New.T": {
+      "dataelement": "UID_TB_ART",
+      "category_combo": "UID_CAT_NEW"
+    },
+    "TB_PREV.N.Already.T": {
+      "dataelement": "UID_TB_PREV",
+      "category_combo": "UID_CAT_ALREADY"
+    },
+    "TB_PREV.N.New.T": {
+      "dataelement": "UID_TB_PREV",
+      "category_combo": "UID_CAT_NEW"
+    },
+    "TX_TB.N.Already.T": {
+      "dataelement": "UID_TX_TB",
+      "category_combo": "UID_CAT_ALREADY"
+    },
+    "TX_TB.N.New.T": {
+      "dataelement": "UID_TX_TB",
+      "category_combo": "UID_CAT_NEW"
+    }
+  }
+}

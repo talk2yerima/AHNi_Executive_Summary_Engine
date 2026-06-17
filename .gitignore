@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Data files (too large for git)
+data/
+output/
+cache/
+
+# Environment
+.env
+
+# VS Code
+.vscode/
+
+# Docker
+.dockerignore
