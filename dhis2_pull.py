@@ -1211,6 +1211,9 @@ for q_raw in PULL_QUARTERS:
     snap_iso    = f"{snap_date[:4]}-{snap_date[4:6]}-{snap_date[6:]}"
     q_start_iso = _quarter_start(q_raw)
     q_label     = QUARTER_LABEL[q_raw]
+    if q_start_iso > snap_iso:
+        log.info("      %s: quarter hasn't started yet (%s > today) — skipping", q_label, q_start_iso)
+        continue
     log.info("      %s: snapshot=%s  HTS range=%s → %s", q_label, snap_iso, q_start_iso, snap_iso)
     radet_data = pull_radet_for_date(snap_iso, q_start_iso, snap_iso)
     for col_name, by_ou in radet_data.items():
@@ -1330,6 +1333,9 @@ for m_raw in PULL_MONTHS:
     snap_iso    = f"{snap_date[:4]}-{snap_date[4:6]}-{snap_date[6:]}"
     m_start_iso = _month_start(m_raw)
     m_label     = MONTH_LABEL[m_raw]
+    if m_start_iso > snap_iso:
+        log.info("      %s: month hasn't started yet (%s > today) — skipping", m_label, m_start_iso)
+        continue
     log.info("      %s: snapshot=%s  HTS range=%s → %s", m_label, snap_iso, m_start_iso, snap_iso)
     radet_data = pull_radet_for_date(snap_iso, m_start_iso, snap_iso)
     for col_name, by_ou in radet_data.items():
