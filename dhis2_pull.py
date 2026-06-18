@@ -112,17 +112,28 @@ def _build_datimid_map(radet_df) -> dict:
     mapping = dict(existing)   # base = previous map
     matched = 0
     for _, row in unique.iterrows():
-        clean = _strip_state_prefix(str(row["Facility Name"]))
+        datim_id = row["DatimId"]
+        clean    = _strip_state_prefix(str(row["Facility Name"]))
+        already_mapped = datim_id in existing
+
         if clean in fac_names:
-            mapping[row["DatimId"]] = fac_names[clean]
+            # Exact name match — always trust it
+            mapping[datim_id] = fac_names[clean]
             matched += 1
         else:
             hit = process.extractOne(clean, list(fac_names.keys()), scorer=fuzz.WRatio, score_cutoff=65)
             if hit:
-                mapping[row["DatimId"]] = fac_names[hit[0]]
-                matched += 1
+                score = hit[1]
+                # Only overwrite an existing entry if confidence is high (≥90)
+                # Low-score matches on already-mapped DatimIds are likely name changes in RADET
+                if already_mapped and score < 90:
+                    log.warning("   DatimId map: low-confidence match for '%s' (score=%.0f→'%s') — keeping existing mapping",
+                                clean, score, hit[0])
+                else:
+                    mapping[datim_id] = fac_names[hit[0]]
+                    matched += 1
             else:
-                log.warning("   DatimId map: no match for '%s' (%s)", clean, row["DatimId"])
+                log.warning("   DatimId map: no match for '%s' (%s)", clean, datim_id)
 
     # Keep only entries whose ou_uid is still in the current facility list
     fac_uid_set = {f["id"] for f in FACILITIES}
