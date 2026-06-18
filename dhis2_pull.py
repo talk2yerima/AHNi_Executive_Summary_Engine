@@ -94,25 +94,45 @@ def _strip_state_prefix(name: str) -> str:
 
 
 def _build_datimid_map(radet_df) -> dict:
-    """Fuzzy-match RADET DatimId → ACEBAY OU_UID via facility names. Saved to config/datimid_map.json."""
+    """Fuzzy-match RADET DatimId → ACEBAY OU_UID via facility names. Saved to config/datimid_map.json.
+    Merges with any existing map so facilities absent from this RADET snapshot are not lost."""
+    import json as _json
     from rapidfuzz import process, fuzz
     fac_names = {_strip_state_prefix(f["name"]): f["id"] for f in FACILITIES}
+
+    # Start from existing map so facilities temporarily absent from this RADET are preserved
+    existing = {}
+    if _DATIMID_MAP_FILE.exists():
+        try:
+            existing = _json.load(open(_DATIMID_MAP_FILE))
+        except Exception:
+            pass
+
     unique = radet_df[["DatimId", "Facility Name"]].drop_duplicates("DatimId")
-    mapping = {}
+    mapping = dict(existing)   # base = previous map
+    matched = 0
     for _, row in unique.iterrows():
         clean = _strip_state_prefix(str(row["Facility Name"]))
         if clean in fac_names:
             mapping[row["DatimId"]] = fac_names[clean]
+            matched += 1
         else:
             hit = process.extractOne(clean, list(fac_names.keys()), scorer=fuzz.WRatio, score_cutoff=65)
             if hit:
                 mapping[row["DatimId"]] = fac_names[hit[0]]
+                matched += 1
             else:
                 log.warning("   DatimId map: no match for '%s' (%s)", clean, row["DatimId"])
+
+    # Keep only entries whose ou_uid is still in the current facility list
+    fac_uid_set = {f["id"] for f in FACILITIES}
+    mapping = {k: v for k, v in mapping.items() if v in fac_uid_set}
+
     _DATIMID_MAP_FILE.parent.mkdir(exist_ok=True)
-    import json as _json
     _json.dump(mapping, open(_DATIMID_MAP_FILE, "w"), indent=2)
-    log.info("   DatimId map: built %d/%d entries → config/datimid_map.json", len(mapping), len(unique))
+    preserved = len(mapping) - matched
+    log.info("   DatimId map: %d from RADET + %d preserved → %d total → config/datimid_map.json",
+             matched, preserved, len(mapping))
     return mapping
 
 
